@@ -43,8 +43,12 @@ class MainWindow(QMainWindow):
         self._printer_state_known = False
         self._workbench_shown = False
         self._ipc_processing = False
+        self._reconnecting = False
         self._print_queue = PrintQueue(self)
         self._print_progress_reset = False
+        self._reconnect_attempt    = 0      # contador de tentativas
+        self._reconnect_countdown  = 5      # segundos até próxima tentativa
+        self._auto_reconnect_stop  = False  # usuário parou manualmente
         self._print_queue.next_job_ready.connect(self._on_queue_next)
         self._print_queue.queue_changed.connect(self._on_queue_badge)
         self._print_queue.play_requested.connect(self._on_queue_next)
@@ -144,40 +148,61 @@ class MainWindow(QMainWindow):
                 1000,
             )
         else:
+            self._ipc_clear()   # remove heartbeat — bridge saberá que o app fechou
             event.accept()
 
     # ── IPC — recebe filepath de nova instância via arquivo de handshake ─────────
     def _setup_ipc(self):
         """Cria e mantém o arquivo IPC atualizado (sinal de vida).
+        Escreve "ALIVE:<timestamp>" a cada 500ms para que o bridge.py possa
+        distinguir um app vivo de um arquivo orphan deixado por crash/fechamento.
         Nova instância do slicer escreve o filepath nesse arquivo.
-        Este timer lê e abre o arquivo, depois o recria vazio (novo sinal de vida).
         """
         self._ipc_file = os.path.join(tempfile.gettempdir(), "se3d_gestor_ipc.txt")
-        # Cria o arquivo vazio como sinal de vida
-        try:
-            with open(self._ipc_file, "w") as f:
-                f.write("")
-        except Exception:
-            pass
+        self._ipc_write_alive()
         self._ipc_timer = QTimer(self)
         self._ipc_timer.setInterval(500)
         self._ipc_timer.timeout.connect(self._check_ipc)
         self._ipc_timer.start()
 
+    def _ipc_write_alive(self):
+        """Escreve o heartbeat de sinal de vida no arquivo IPC."""
+        import time as _time
+        try:
+            with open(self._ipc_file, "w", encoding="utf-8") as f:
+                f.write(f"ALIVE:{_time.time():.3f}")
+        except Exception:
+            pass
+
+    def _ipc_clear(self):
+        """Remove o arquivo IPC ao fechar — evita false-positive no bridge."""
+        try:
+            if os.path.exists(self._ipc_file):
+                os.remove(self._ipc_file)
+        except Exception:
+            pass
+
     def _check_ipc(self):
-        """Lê filepath se presente, depois faz touch para sinalizar que ainda está vivo."""
+        """Lê filepath se presente, depois escreve heartbeat ALIVE:<ts>."""
+        import time as _time
         try:
             if not os.path.exists(self._ipc_file):
-                with open(self._ipc_file, "w") as f:
-                    f.write("")
+                self._ipc_write_alive()
                 return
             with open(self._ipc_file, "r", encoding="utf-8") as f:
-                filepath = f.read().strip()
-            # Reescreve vazio imediatamente (evita leitura dupla no próximo tick)
-            with open(self._ipc_file, "w") as f:
-                f.write("")
+                content = f.read().strip()
+
+            # Heartbeat próprio ou arquivo vazio — apenas renovar
+            if not content or content.startswith("ALIVE:"):
+                self._ipc_write_alive()
+                return
+
+            # Tem um filepath escrito pelo bridge — processar
+            filepath = content
+            # Reescreve heartbeat imediatamente (evita leitura dupla)
+            self._ipc_write_alive()
+
             if filepath and os.path.isfile(filepath):
-                # Debounce — ignora se já está processando um arquivo
                 if getattr(self, "_ipc_processing", False):
                     return
                 self._ipc_processing = True
@@ -186,6 +211,7 @@ class MainWindow(QMainWindow):
                 self._ipc_processing = False
         except Exception:
             self._ipc_processing = False
+            self._ipc_write_alive()
 
     def _open_file(self, filepath: str):
         """Abre arquivo recebido via IPC ou argumento de linha de comando.
@@ -391,8 +417,7 @@ class MainWindow(QMainWindow):
         # e um QWidget só pode ter um pai por vez.
 
         self._btn_reconnect = QPushButton("CONNECT")
-        
-        self._btn_reconnect.setMinimumWidth(100)
+        self._btn_reconnect.setMinimumWidth(140)
         self._btn_reconnect.setFixedHeight(28)
         self._btn_reconnect.setStyleSheet("""
             QPushButton { background:#003D52; border:1px solid #00E5FF; color:#00E5FF;
@@ -402,10 +427,18 @@ class MainWindow(QMainWindow):
         """)
         self._btn_reconnect.clicked.connect(self._do_connect)
 
+        from PyQt6.QtWidgets import QCheckBox as _QCB
+        self._chk_auto_reconnect = _QCB("Auto")
+        self._chk_auto_reconnect.setChecked(True)
+        self._chk_auto_reconnect.setFont(QFont("Courier New", 9))
+        self._chk_auto_reconnect.setStyleSheet("color:#607080;")
+        self._chk_auto_reconnect.setToolTip("Reconexão automática")
+        self._chk_auto_reconnect.toggled.connect(self._on_auto_reconnect_toggled)
+
         nl.addWidget(btn_cfg)
         nl.addStretch()
 
-        self._btn_queue = QPushButton("JOBS QUEUE") 
+        self._btn_queue = QPushButton("JOBS QUEUE")
         self._btn_queue.setMinimumWidth(70)
         self._btn_queue.setFixedHeight(28)
         self._btn_queue.setStyleSheet("""
@@ -416,6 +449,8 @@ class MainWindow(QMainWindow):
         self._btn_queue.clicked.connect(self._show_queue_dialog)
         nl.addWidget(self._btn_queue)
         nl.addSpacing(8)
+        nl.addWidget(self._chk_auto_reconnect)
+        nl.addSpacing(4)
         nl.addWidget(self._btn_reconnect)
         cl.addWidget(nav)
 
@@ -480,7 +515,7 @@ class MainWindow(QMainWindow):
 
     # ── MQTT callbacks ────────────────────────────────────────────────────────
     def _on_mqtt_connected(self):
-        # Reseta job imediatamente — antes de qualquer signal processar
+        self._reconnecting = False
         if hasattr(self._print, "_current_job"):
             self._print._current_job   = None
             self._print._current_thumb = None
@@ -497,7 +532,6 @@ class MainWindow(QMainWindow):
         self._print.update_connection(connected=True, ip=ip)
         if hasattr(self._print, "set_mqtt"):
             self._print.set_mqtt(self._mqtt)
-        # Conecta sinal print_started para travar _printing_active imediatamente
         if hasattr(self._print, "print_started"):
             try:
                 self._print.print_started.disconnect(self._on_print_started)
@@ -505,10 +539,13 @@ class MainWindow(QMainWindow):
                 pass
             self._print.print_started.connect(self._on_print_started)
 
-        # Reseta flags de estado para nova conexão
         self._printer_state_known = False
         self._check_queue_attempts = 0
 
+        # força IDLE no colormap ao conectar
+        self._print._colormap._connected = True
+        self._print._colormap._last_state = "IDLE"
+        self._print._colormap._do_refresh_print_btn()
     def _on_mqtt_disconnected(self, reason: str):
         self._set_status("disconnected", reason)
         self.statusBar().showMessage(f"DISCONNECTED  |  {reason}")
@@ -516,9 +553,16 @@ class MainWindow(QMainWindow):
         self._btn_reconnect.clicked.disconnect()
         self._btn_reconnect.clicked.connect(self._do_connect)
         self._print.update_connection(connected=False)
-        self._printing_active = False
+        self._printing_active    = False
         self._printer_state_known = False
-        self._workbench_shown = False
+        self._workbench_shown    = False
+
+        # Inicia reconexão automática se habilitada
+        if self._chk_auto_reconnect.isChecked():
+            self._auto_reconnect_stop = False
+            self._reconnect_attempt   = 0
+            self._reconnect_countdown = 5
+            self._start_reconnect_display()
 
     def _on_mqtt_error(self, msg: str):
         self._set_status("error")
@@ -638,24 +682,52 @@ class MainWindow(QMainWindow):
         if source == "status":
             state = payload.get("status", "").lower()
             idle_states = {"idle", "free", "ready", "standby",
-                           "stoped", "stopped", "stop", "finish", "complete", "finished"}
+                           "stoped", "stopped", "stop", "stopping",
+                           "finish", "complete", "finished"}
             if state in idle_states:
                 self._printer_state_known = True
                 was_printing = getattr(self, "_printing_active", False)
                 self._printing_active = False
-                self._control.update_printer_info({"status": "idle"})
+                display_state = "stopping" if state == "stopping" else "idle"
+                self._control.update_printer_info({"status": display_state})
                 self._set_status("idle")
                 self._print.update_printer_state("IDLE")
                 if hasattr(self._control, "set_printing_slot"):
                     self._control.set_printing_slot(-1)
-                # Só dispara fila se: estava imprimindo nesta sessão (_workbench_shown)
-                # OU se reconectou e a impressora confirmou idle após ter recebido status busy
-                if (not self._print_queue.is_empty()
-                        and not self._queue_dialog_open
-                        and was_printing):
-                    QTimer.singleShot(1500, self._print_queue.on_print_finished)
+
+                # "stopping" = impressora ainda está parando (resfriando, retraindo).
+                # Não dispara a fila agora — agenda verificação após 4s para confirmar idle.
+                # Se nesse intervalo chegar outro status "stopping" ou ocupado, o timer
+                # é cancelado e remarcado, evitando disparo prematuro.
+                if state == "stopping":
+                    # Cancela timer anterior se existir
+                    _t = getattr(self, "_idle_confirm_timer", None)
+                    if _t is not None:
+                        _t.stop()
+                    self._idle_confirm_timer = QTimer(self)
+                    self._idle_confirm_timer.setSingleShot(True)
+                    self._idle_confirm_timer.timeout.connect(
+                        lambda: self._check_idle_and_trigger_queue(was_printing)
+                    )
+                    self._idle_confirm_timer.start(4000)
+                else:
+                    # idle/finished/complete real — cancela qualquer timer pendente
+                    _t = getattr(self, "_idle_confirm_timer", None)
+                    if _t is not None:
+                        _t.stop()
+                        self._idle_confirm_timer = None
+                    # Só dispara fila se estava imprimindo nesta sessão
+                    if (not self._print_queue.is_empty()
+                            and not self._queue_dialog_open
+                            and was_printing):
+                        QTimer.singleShot(1500, self._print_queue.on_print_finished)
             elif state:
-                # Qualquer outro estado não-vazio = impressora ocupada
+                # Qualquer estado não-vazio = impressora ocupada
+                # Cancela timer de confirmação de idle se estava pendente
+                _t = getattr(self, "_idle_confirm_timer", None)
+                if _t is not None:
+                    _t.stop()
+                    self._idle_confirm_timer = None
                 self._printer_state_known = True
                 self._printing_active = True
                 self._control.update_printer_info({"status": state})
@@ -723,7 +795,8 @@ class MainWindow(QMainWindow):
 
         state = info.get("status", "").lower()
         idle_states = {"ready", "idle", "free", "standby",
-                       "stoped", "stopped", "stop", "finish", "complete", "finished"}
+                       "stoped", "stopped", "stop", "stopping",
+                       "finish", "complete", "finished"}
         if state in idle_states:
             self._printing_active = False
             self._set_status("idle")
@@ -759,6 +832,7 @@ class MainWindow(QMainWindow):
             self._printing_active = False
             self._workbench_shown = False
             self._print_progress_reset = False
+
             # Limpa PNG de preview pois impressão terminou
             if hasattr(self._print, "on_print_finished"):
                 self._print.on_print_finished()
@@ -768,7 +842,9 @@ class MainWindow(QMainWindow):
             # Safety: if stuck on upload screen (index 3), force back to setup
             if hasattr(self._print, "_stack") and self._print._stack.currentIndex() == 3:
                 QTimer.singleShot(200, lambda: self._print._stack.setCurrentIndex(0))
-            if was_printing:
+            # Para "stop/stoped" não dispara fila aqui — aguarda confirmação via
+            # source==status (idle real após stopping). Para finish/complete dispara.
+            if was_printing and action in ("finish", "complete"):
                 QTimer.singleShot(2000, self._print_queue.on_print_finished)
 
         if not data:
@@ -862,6 +938,44 @@ class MainWindow(QMainWindow):
         Trava _printing_active antes de qualquer resposta MQTT, evitando que
         um segundo arquivo recebido via IPC seja aberto em vez de enfileirado."""
         self._printing_active = True
+
+    def _check_idle_and_trigger_queue(self, was_printing: bool):
+        """Chamado 4s após entrar em 'stopping'.
+        Só dispara a fila se a impressora ainda está idle (não voltou a imprimir)
+        e não há dialog de fila já aberto. Isso evita que um 'stopping' transitório
+        acione a fila antes da impressora realmente parar."""
+        self._idle_confirm_timer = None
+        # Se voltou a imprimir entre o stopping e agora, ignora
+        if getattr(self, "_printing_active", False):
+            return
+        if self._queue_dialog_open:
+            return
+        if not was_printing:
+            return
+        if self._print_queue.is_empty():
+            return
+        # Pede um status atualizado à impressora e aguarda mais 3s para confirmar
+        if self._mqtt and self._mqtt.is_connected:
+            try:
+                self._mqtt.request_info()
+            except Exception:
+                pass
+        # Timer final de confirmação — se após 3s ainda estiver idle, dispara
+        self._idle_final_timer = QTimer(self)
+        self._idle_final_timer.setSingleShot(True)
+        self._idle_final_timer.timeout.connect(self._trigger_queue_if_still_idle)
+        self._idle_final_timer.start(3000)
+
+    def _trigger_queue_if_still_idle(self):
+        """Disparo final da fila — só executa se impressora ainda estiver idle."""
+        self._idle_final_timer = None
+        if getattr(self, "_printing_active", False):
+            return
+        if self._queue_dialog_open:
+            return
+        if self._print_queue.is_empty():
+            return
+        self._print_queue.on_print_finished()
 
     # ── Command router ────────────────────────────────────────────────────────
     def _on_command(self, cmd: str, value):
@@ -1069,7 +1183,6 @@ class MainWindow(QMainWindow):
         ip   = self._settings.get("printer_ip", "")
         mode = self._settings.get("connection_mode", "cloud")
 
-        # Cria o cliente MQTT uma única vez aqui
         self._mqtt = build_client(mode, self)
         self._wire_mqtt()
 
@@ -1082,22 +1195,105 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentIndex(2)
 
         if ip:
-            # Pequeno delay para garantir que a UI está pronta e o arquivo do slicer já foi processado
             QTimer.singleShot(800, self._do_connect)
 
-        # Periodic status refresh every 30s — recovers from stale MQTT state
+        # Timer de 1s para o display do botão de reconexão
+        self._reconnect_display_timer = QTimer(self)
+        self._reconnect_display_timer.setInterval(1000)
+        self._reconnect_display_timer.timeout.connect(self._on_reconnect_tick)
+
+        # Timer de 30s para refresh de status quando conectado
         self._status_refresh_timer = QTimer(self)
         self._status_refresh_timer.setInterval(30000)
         self._status_refresh_timer.timeout.connect(self._periodic_status_refresh)
         self._status_refresh_timer.start()
 
+
+
     def _periodic_status_refresh(self):
-        """Every 30s, request fresh printer state to recover from stale MQTT."""
         if self._mqtt and self._mqtt.is_connected:
             try:
                 self._mqtt.request_info()
             except Exception:
                 pass
+
+    def _start_reconnect_display(self):
+        if not self._reconnect_display_timer.isActive():
+            self._reconnect_countdown = 5
+            self._reconnect_display_timer.start()
+            self._update_reconnect_btn()
+            # Desconecta handler atual e aponta para cancelar
+            try:
+                self._btn_reconnect.clicked.disconnect()
+            except Exception:
+                pass
+            self._btn_reconnect.clicked.connect(self._cancel_auto_reconnect)
+
+    def _stop_reconnect_display(self):
+        self._reconnect_display_timer.stop()
+        self._btn_reconnect.setText("CONNECT")
+        self._btn_reconnect.setStyleSheet("""
+            QPushButton { background:#003D52; border:1px solid #00E5FF; color:#00E5FF;
+                          font-family:'Courier New'; font-size:10px; letter-spacing:1px;
+                          border-radius:2px; padding:0 10px; }
+            QPushButton:hover { background:#005070; }
+        """)
+        try:
+            self._btn_reconnect.clicked.disconnect()
+        except Exception:
+            pass
+        self._btn_reconnect.clicked.connect(self._do_connect)
+
+    def _update_reconnect_btn(self):
+        self._btn_reconnect.setText(f"RECONNECTING ({self._reconnect_countdown}s)")
+        self._btn_reconnect.setStyleSheet("""
+            QPushButton { background:#1A1000; border:1px solid #FFB300; color:#FFB300;
+                          font-family:'Courier New'; font-size:10px; letter-spacing:1px;
+                          border-radius:2px; padding:0 10px; }
+            QPushButton:hover { background:#2A1800; }
+        """)
+
+    def _on_reconnect_tick(self):
+        if self._auto_reconnect_stop or self._mqtt.is_connected:
+            self._stop_reconnect_display()
+            return
+
+        self._reconnect_countdown -= 1
+        self._update_reconnect_btn()
+
+        if self._reconnect_countdown <= 0:
+            # Tenta reconectar
+            self._reconnect_attempt += 1
+            ip = self._settings.get("printer_ip", "").strip()
+            if ip:
+                self._do_connect()
+
+            # Mostra erro a cada 20 tentativas
+            if self._reconnect_attempt % 20 == 0:
+                self._on_mqtt_error(
+                    f"Não foi possível reconectar após {self._reconnect_attempt} tentativas.\n\n"
+                    f"IP: {ip}\nVerifique a impressora e a rede."
+                )
+
+            self._reconnect_countdown = 5
+
+    def _cancel_auto_reconnect(self):
+        self._auto_reconnect_stop = True
+        self._chk_auto_reconnect.setChecked(False)
+        self._stop_reconnect_display()
+
+    def _on_auto_reconnect_toggled(self, checked: bool):
+        if not checked:
+            self._auto_reconnect_stop = True
+            self._stop_reconnect_display()
+        else:
+            self._auto_reconnect_stop = False
+            # Se já está desconectado, inicia imediatamente
+            if self._mqtt and not self._mqtt.is_connected:
+                self._reconnect_attempt   = 0
+                self._reconnect_countdown = 5
+                self._start_reconnect_display()
+
 
     # ── Helpers ────────────────────────────────────────────────────────────────
     def _set_status(self, state: str, log_msg: str = ""):

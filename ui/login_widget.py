@@ -296,6 +296,7 @@ class LoginWidget(QWidget):
         self._chk_remember.setChecked(s.get("remember_login", False))
         cl.addWidget(self._chk_remember)
 
+
         # ── Slicer Next auto-token ─────────────────────────────
         sep_slicer = QFrame(col_l)
         sep_slicer.setFrameShape(QFrame.Shape.HLine)
@@ -511,6 +512,33 @@ class LoginWidget(QWidget):
             g5.addWidget(chk)
         right_lay.addWidget(grp_opts)
 
+        # ── Upload mode selector ─────────────────────────────
+        upload_row = QWidget(grp_opts)
+        upload_lay = QHBoxLayout(upload_row)
+        upload_lay.setContentsMargins(0, 8, 0, 0)
+        upload_lay.setSpacing(12)
+
+        lbl_upload = QLabel("UPLOAD  MODE", upload_row)
+        lbl_upload.setFont(QFont("Courier New", 10))
+        lbl_upload.setStyleSheet("color:#607080;")
+
+        self._combo_upload = QComboBox(upload_row)
+        self._combo_upload.setFont(QFont("Courier New", 10))
+        self._combo_upload.addItem(".gcode.3mf", "full")
+        self._combo_upload.addItem(".gcode (recommended)", "gcode_only")
+
+        # Carregar valor salvo
+        saved_mode = self._settings.get("upload_mode", "full")
+        for i in range(self._combo_upload.count()):
+            if self._combo_upload.itemData(i) == saved_mode:
+                self._combo_upload.setCurrentIndex(i)
+                break
+
+        upload_lay.addWidget(lbl_upload)
+        upload_lay.addWidget(self._combo_upload, 1)
+        upload_lay.addStretch()
+        g5.addWidget(upload_row)
+
         # ── Log panel ─────────────────────────────────────────
         grp_log = QGroupBox("CONNECTION  LOG", right_w)
         g6 = QVBoxLayout(grp_log)
@@ -662,6 +690,7 @@ class LoginWidget(QWidget):
             "timelapse":        self._chk_timelapse.isChecked(),
             "flow_calibration": self._chk_flow.isChecked(),
         }
+        d["upload_mode"] = self._combo_upload.currentData()
         return d
 
     def _on_save(self):

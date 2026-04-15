@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QStackedWidget, QLineEdit, QMessageBox,
     QSizePolicy, QScrollArea, QTextEdit, QSplitter
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal,pyqtSlot, QTimer,QMetaObject, Qt
 from PyQt6.QtGui import QFont, QPixmap, QImage, QColor, QPainter, QPen, QBrush
 
 
@@ -571,6 +571,8 @@ class ColorMapScreen(QWidget):
         self._thumbnail = None
         self._meta      = {}
         self._map_rows: list[ColorMapRow] = []
+        self._connected = False
+        self._last_state = "OFFLINE"
         self._build_ui()
 
     def _build_ui(self):
@@ -659,11 +661,35 @@ class ColorMapScreen(QWidget):
             "padding:0 8px;border-radius:3px;}"
             "QPushButton:hover{color:#00E5FF;border-color:#00E5FF;}"
         )
-        btn_refresh.clicked.connect(self._rebuild_map_rows)
+        btn_refresh.clicked.connect(lambda: self._rebuild_map_rows(preserve_user_selection=False))
         map_hdr.addWidget(lbl_map)
         map_hdr.addStretch()
         map_hdr.addWidget(btn_refresh)
         center.addLayout(map_hdr)
+
+        # ── Nome do arquivo a enviar ──
+        name_row = QHBoxLayout()
+        name_row.setSpacing(6)
+        lbl_fname = QLabel("FILE  NAME")
+        lbl_fname.setFont(QFont("Courier New", 9))
+        lbl_fname.setStyleSheet("color:#607080; letter-spacing:1px;")
+        lbl_fname.setFixedWidth(76)
+        self._inp_filename = QLineEdit()
+        self._inp_filename.setFont(QFont("Courier New", 10))
+        self._inp_filename.setPlaceholderText("nome do arquivo...")
+        self._inp_filename.setStyleSheet("""
+            QLineEdit { background:#0D0F11; border:1px solid #1E2D3D; color:#C8D0D8;
+                        font-family:'Courier New'; font-size:10px; padding:4px 8px;
+                        border-radius:2px; }
+            QLineEdit:focus { border-color:#00E5FF; }
+        """)
+        self._lbl_fname_ext = QLabel(".gcode.3mf")
+        self._lbl_fname_ext.setFont(QFont("Courier New", 9))
+        self._lbl_fname_ext.setStyleSheet("color:#3A5565;")
+        name_row.addWidget(lbl_fname)
+        name_row.addWidget(self._inp_filename, 1)
+        name_row.addWidget(self._lbl_fname_ext)
+        center.addLayout(name_row)
 
         lbl_hint = QLabel("Map each slicer slot to the matching ACE Pro slot.")
         lbl_hint.setFont(QFont("Courier New", 9))
@@ -834,7 +860,7 @@ class ColorMapScreen(QWidget):
         btn_cancel.clicked.connect(self.cancelled.emit)
 
         # Botão "Print Status" — navega para tela de workbench/acompanhar impressão
-        btn_status = QPushButton("▶  Print Status")
+        btn_status = QPushButton("⫷⫣⫻ STATUS ⫻⫦⫸")
         btn_status.setFont(QFont("Courier New", 10))
         btn_status.setMinimumHeight(38)
         btn_status.setMinimumWidth(130)
@@ -847,20 +873,110 @@ class ColorMapScreen(QWidget):
         """)
         btn_status.clicked.connect(self.watch_requested.emit)
 
-        self._btn_start = QPushButton("▶  Start Print")
-        self._btn_start.setFont(QFont("Courier New", 13, QFont.Weight.Bold))
-        self._btn_start.setObjectName("primary")
-        self._btn_start.setMinimumHeight(42)
-        self._btn_start.setMinimumWidth(150)
-        self._btn_start.setEnabled(False)
+        # ── Split button: ação principal + dropdown de alternativas ──────────
+        # Ações disponíveis — (id, label)
+        self._ACTIONS = [
+            ("print",      "▶ PRINT"),
+            ("save_3mf",   "💾 EXPORT"),
+        ]
+        self._current_action = "print"   # ação padrão
+
+        # Container para o split button (botão principal + seta)
+        split_container = QWidget()
+        split_container.setEnabled(False)   # desabilitado até arquivo carregado
+        split_lay = QHBoxLayout(split_container)
+        split_lay.setContentsMargins(0, 0, 0, 0)
+        split_lay.setSpacing(0)
+
+        # Botão principal — executa a ação atual
+        self._btn_start = QPushButton("▶ PRINT")
+        self._btn_start.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        self._btn_start.setMinimumHeight(38)
+        self._btn_start.setStyleSheet("""
+            QPushButton {
+                background:#003D52; border:1px solid #00E5FF; color:#00E5FF;
+                font-family:'Courier New'; font-size:11px; font-weight:bold;
+                letter-spacing:1px; border-right:none;
+                border-radius:2px 0 0 2px; padding:0 14px;
+            }
+            QPushButton:hover  { background:#005070; }
+            QPushButton:pressed{ background:#00E5FF; color:#000; }
+            QPushButton:disabled{ background:#0D0F11; border-color:#1A2535;
+                                   color:#2A3540; border-right:none; }
+        """)
         self._btn_start.clicked.connect(self._on_start)
 
-        btn_row.addWidget(btn_cancel)
-        btn_row.addSpacing(8)
-        btn_row.addWidget(btn_status)
-        btn_row.addStretch()
-        btn_row.addWidget(self._btn_start)
-        right.addLayout(btn_row)
+        # Botão seta — abre menu de opções
+        from PyQt6.QtWidgets import QMenu
+        self._btn_arrow = QPushButton("▾")
+        self._btn_arrow.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        self._btn_arrow.setFixedWidth(26)
+        self._btn_arrow.setMinimumHeight(38)
+        self._btn_arrow.setStyleSheet("""
+            QPushButton {
+                background:#003D52; border:1px solid #00E5FF; color:#00E5FF;
+                font-size:12px; border-radius:0 2px 2px 0; padding:0;
+            }
+            QPushButton:hover  { background:#005070; }
+            QPushButton:pressed{ background:#00E5FF; color:#000; }
+            QPushButton:disabled{ background:#0D0F11; border-color:#1A2535; color:#2A3540; }
+        """)
+
+        def _show_action_menu():
+            menu = QMenu(self._btn_arrow)
+            menu.setStyleSheet("""
+                QMenu {
+                    background:#111820; border:1px solid #00E5FF;
+                    color:#C8D0D8; font-family:'Courier New'; font-size:11px;
+                    padding:4px 0;
+                }
+                QMenu::item { padding:7px 24px 7px 14px; }
+                QMenu::item:selected { background:#003D52; color:#00E5FF; }
+                QMenu::item:checked  { color:#00E5FF; }
+            """)
+            for action_id, action_label in self._ACTIONS:
+                act = menu.addAction(action_label)
+                act.setCheckable(True)
+                act.setChecked(action_id == self._current_action)
+                act.setData(action_id)
+
+            chosen = menu.exec(
+                self._btn_arrow.mapToGlobal(
+                    self._btn_arrow.rect().bottomLeft()
+                )
+            )
+            if chosen and chosen.data():
+                self._current_action = chosen.data()
+                label = next(lbl for aid, lbl in self._ACTIONS
+                             if aid == self._current_action)
+                self._btn_start.setText(label)
+
+        self._btn_arrow.clicked.connect(_show_action_menu)
+        self._split_container = split_container
+
+        split_lay.addWidget(self._btn_start)
+        split_lay.addWidget(self._btn_arrow)
+
+        # ── Layout dos botões em 2 linhas ──────────────────────────────────
+        # Linha 1: Print Status (esquerda) | Split button (direita)
+        # Linha 2: Cancel (largura total)
+        from PyQt6.QtWidgets import QVBoxLayout as _QVB
+        btn_area = _QVB()
+        btn_area.setSpacing(6)
+        btn_area.setContentsMargins(0, 0, 0, 0)
+
+        btn_top = QHBoxLayout()
+        btn_top.setSpacing(8)
+        btn_top.addWidget(btn_status, 1)
+        btn_top.addWidget(split_container, 1)
+
+        btn_bottom = QHBoxLayout()
+        btn_bottom.addWidget(btn_cancel)
+
+        btn_area.addLayout(btn_top)
+        btn_area.addLayout(btn_bottom)
+
+        right.addLayout(btn_area)
 
         content.addLayout(right, 2)
         root.addLayout(content, 1)
@@ -918,7 +1034,19 @@ class ColorMapScreen(QWidget):
         self._m_layers.setText(self._meta.get("layer_count",     "--"))
 
         self._rebuild_map_rows()
-        self._btn_start.setEnabled(True)
+
+        # Preenche nome sugerido no campo FILE NAME
+        base = os.path.splitext(os.path.basename(filepath))[0]
+        for suf in (".gcode.3mf", "_se3d.gcode", "_se3d", ".gcode"):
+            if base.endswith(suf):
+                base = base[:-len(suf)]
+                break
+        self._inp_filename.setText(base)
+        upload_mode = self._settings.get("upload_mode", "full")
+        self._lbl_fname_ext.setText(".gcode" if upload_mode == "gcode_only" else ".gcode.3mf")
+
+        connected = getattr(self, "_connected", False)
+        self._refresh_print_btn()
 
         # ── Aviso ACE desconectado ───────────────────────────────────────────
         ace_connected = self._settings.get("ace_connected", False)
@@ -967,7 +1095,13 @@ class ColorMapScreen(QWidget):
                     "ou conecte um 2º ACE Pro antes de imprimir."
                 )
 
-    def _rebuild_map_rows(self):
+    def _rebuild_map_rows(self, preserve_user_selection: bool = True):
+        # Salva seleções atuais do usuário antes de reconstruir
+        saved = {}
+        if preserve_user_selection:
+            for row in self._map_rows:
+                saved[row._slot_idx] = row._combo.currentIndex()
+
         self._map_rows.clear()
         while self._map_layout.count() > 1:
             item = self._map_layout.takeAt(0)
@@ -995,6 +1129,18 @@ class ColorMapScreen(QWidget):
             color = [int(_c[0]), int(_c[1]), int(_c[2])] if len(_c) >= 3 else [200, 200, 200]
             mat   = slicer_types[t_idx]  if t_idx < len(slicer_types)  else "—"
             row   = ColorMapRow(t_idx, color, mat, ace_slots_show)
+
+            # Restaura seleção do usuário se existir
+            if preserve_user_selection and t_idx in saved:
+                idx = saved[t_idx]
+                if 0 <= idx < row._combo.count():
+                    row._combo.setCurrentIndex(idx)
+                    # Atualiza pill de cor ACE manualmente
+                    if idx < len(ace_slots_show):
+                        row._ace_pill.set_color(ace_slots_show[idx].get("paint_color", [255,255,255]))
+                        row._ace_pill._label = f"S{idx + 1}"
+                        row._ace_pill.update()
+
             self._map_layout.insertWidget(self._map_layout.count() - 1, row)
             self._map_rows.append(row)
 
@@ -1005,9 +1151,7 @@ class ColorMapScreen(QWidget):
                     mismatch = True
 
         if mismatch:
-            self._lbl_mismatch.setText(
-                "⚠  Color mismatch — verifique o mapeamento ou sincronize o ACE Pro."
-            )
+            self._lbl_mismatch.setText("⚠  Color mismatch.")
         else:
             self._lbl_mismatch.setText("")
 
@@ -1024,30 +1168,48 @@ class ColorMapScreen(QWidget):
             pass
         return sorted(used)
 
-    def update_connection(self, connected: bool, ip: str = ""):
-        mode = self._settings.get("connection_mode", "cloud")
+    
+
+    def _refresh_print_btn(self):
+        QMetaObject.invokeMethod(self, "_do_refresh_print_btn",
+                                Qt.ConnectionType.QueuedConnection)
+
+    @pyqtSlot()
+    def _do_refresh_print_btn(self):
+        connected   = getattr(self, "_connected", False)
+        last_state  = getattr(self, "_last_state", "OFFLINE")
+        is_idle     = last_state in ("IDLE", "")
+        file_loaded = bool(getattr(self, "_filepath", None))
+        can_print   = connected and is_idle and file_loaded
+        if hasattr(self, "_split_container"):
+            self._split_container.setEnabled(can_print)
+
+    def update_connection_OLDOLD(self, connected: bool, ip: str = ""):
+        self._connected = connected
         if connected:
             name = f"Anycubic KS1  |  {ip}" if ip else "Anycubic KS1-C"
             self._combo_printer.setItemText(0, name)
-           # self._lbl_pstatus.setText("● CONNECTED")
-           # self._lbl_pstatus.setStyleSheet(
-            #    "color:#00FF88; font-family:'Courier New'; font-size:10px;"
-            #)
-            self._chk_ai.setEnabled(mode == "cloud")
+            self._chk_ai.setEnabled(False)
         else:
-            #self._lbl_pstatus.setText("● DISCONNECTED")
-            #self._lbl_pstatus.setStyleSheet(
-            #    "color:#FF4444; font-family:'Courier New'; font-size:10px;"
-            #)
             self._chk_ai.setEnabled(False)
 
+        file_loaded = bool(getattr(self, "_filepath", None))
+        last_state  = getattr(self, "_last_state", "OFFLINE")
+        is_idle     = last_state in ("IDLE", "")
+        can_print   = connected and is_idle and file_loaded
+
+        if hasattr(self, "_split_container"):
+            self._split_container.setEnabled(can_print)
+
+    def update_connection(self, connected: bool, ip: str = ""):
+        self._connected = connected
+        self._chk_ai.setEnabled(False)
+        self._refresh_print_btn()
+
+
     def update_printer_state(self, state: str):
-        state_up = state.upper()
-        color = "#FFB300" if state_up in ("BUSY", "PRINTING", "PAUSED") else "#00FF88"
-        #self._lbl_pstatus.setText(f"● {state_up}")
-        #self._lbl_pstatus.setStyleSheet(
-        #   f"color:{color}; font-family:'Courier New'; font-size:10px;"
-        #)
+        self._last_state = state
+        self._refresh_print_btn()
 
     def refresh_ace_slots(self):
         if hasattr(self, "_filepath") and self._filepath:
@@ -1057,7 +1219,7 @@ class ColorMapScreen(QWidget):
         if not self._filepath:
             return
         mapping = [r.get_mapping() for r in self._map_rows]
-        dry_mode  = self._combo_dry.currentData()   # 0, 1 or 2
+        dry_mode  = self._combo_dry.currentData()
         dry_temp  = self._sp_dry_temp.value()
         dry_hours = self._sp_dry_hours.value()
         opts = {
@@ -1070,15 +1232,185 @@ class ColorMapScreen(QWidget):
             "dry_temp":         dry_temp  if dry_mode > 0 else 0,
             "dry_hours":        dry_hours if dry_mode > 0 else 0,
         }
+        # Nome digitado pelo usuário, ou fallback para nome do arquivo
+        custom_name = self._inp_filename.text().strip()
+        if not custom_name:
+            custom_name = os.path.splitext(os.path.basename(self._filepath))[0]
+            for suf in (".gcode.3mf", "_se3d.gcode", "_se3d", ".gcode"):
+                if custom_name.endswith(suf):
+                    custom_name = custom_name[:-len(suf)]
+                    break
+
         job = {
             "filepath":      self._filepath,
-            "task_name":     os.path.splitext(os.path.basename(self._filepath))[0],
+            "task_name":     custom_name,
             "color_mapping": mapping,
             "thumbnail":     self._thumbnail,
             "preview_png":   getattr(self, "_preview_png", None),
             **opts,
         }
-        self.confirmed.emit(job)
+
+        action = getattr(self, "_current_action", "print")
+        if action == "save_3mf":
+            self._on_save_3mf(job)
+        else:
+            self.confirmed.emit(job)
+
+    def _on_save_3mf(self, job: dict):
+        """Exporta o arquivo: .gcode processado (modo gcode_only) ou .gcode.3mf (modo full)."""
+        import threading
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
+        from PyQt6.QtCore import Qt
+
+        filepath     = job["filepath"]
+        fname_lower  = filepath.lower()
+        is_3mf       = fname_lower.endswith(".3mf") and not fname_lower.endswith(".gcode.3mf")
+        upload_mode  = self._settings.get("upload_mode", "full")
+
+        configured_slots = self._settings.get("slots", [])
+        # Para gcode_only: paint_info usa índices físicos ACE Pro (compatibilidade reimpressão)
+        # Para full (3mf): pack() já recebe configured_slots e usa paint_index/index internamente
+        pack_slots_map = []
+        for m in job.get("color_mapping", []):
+            slicer_idx = m["slicer"]
+            ace_idx    = m["ace"]
+            if ace_idx < len(configured_slots):
+                s = configured_slots[ace_idx]
+                pack_slots_map.append({
+                    "paint_index":   slicer_idx,
+                    "paint_color":   s.get("paint_color",   [200, 200, 200]),
+                    "material_type": s.get("material_type", "PLA"),
+                })
+
+        prog_label = "Processando .gcode..." if upload_mode == "gcode_only" else "Gerando .gcode.3mf..."
+        prog = QProgressDialog(prog_label, None, 0, 0, self)
+        prog.setWindowTitle("Aguarde")
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumWidth(320)
+        prog.setCancelButton(None)
+        prog.show()
+
+        result_path = [None]
+        error_msg   = [None]
+
+        def _worker():
+            try:
+                from main import GCode3mfPacker
+
+                if upload_mode == "gcode_only":
+                    # Lê o gcode (de arquivo direto ou de dentro de um .gcode.3mf)
+                    if fname_lower.endswith(".gcode.3mf"):
+                        src = GCode3mfPacker.extract_gcode(filepath)
+                    elif is_3mf:
+                        src = filepath   # .3mf puro — extrai também
+                        src = GCode3mfPacker.extract_gcode(filepath)
+                    else:
+                        src = filepath
+
+                    for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+                        try:
+                            with open(src, "r", encoding=enc) as f:
+                                gcode = f.read()
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                    else:
+                        with open(src, "rb") as f:
+                            gcode = f.read().decode("utf-8", errors="replace")
+
+                    # Aplica conversões (M486 → EXCLUDE_OBJECT, paint_info)
+                    if "M486 S" in gcode and 'A"' in gcode:
+                        gcode = GCode3mfPacker._convert_orca_to_klipper_objects(gcode)
+                    if pack_slots_map:
+                        gcode = GCode3mfPacker._inject_paint_info(gcode, pack_slots_map)
+
+                    # Injeta topdown thumbnail no gcode
+                    topdown_go = GCode3mfPacker._generate_topdown_thumb(gcode)
+                    if topdown_go:
+                        gcode = GCode3mfPacker._replace_topdown_in_gcode(gcode, topdown_go)
+
+                    import tempfile as _tmp
+                    base = os.path.splitext(os.path.basename(src))[0]
+                    for suf in ("_se3d.gcode", "_se3d", ".gcode"):
+                        if base.endswith(suf):
+                            base = base[:-len(suf)]
+                    result_path[0] = os.path.join(_tmp.gettempdir(), base + "_se3d.gcode")
+                    with open(result_path[0], "w", encoding="utf-8") as f:
+                        f.write(gcode)
+
+                else:
+                    # Modo full — empacota como .gcode.3mf
+                    if is_3mf:
+                        result_path[0] = filepath
+                    else:
+                        original = filepath
+                        if fname_lower.endswith(".gcode.3mf"):
+                            original = GCode3mfPacker.extract_gcode(filepath)
+                        pack_slots = pack_slots_map if pack_slots_map else (
+                            configured_slots if self._settings.get("ace_connected") else None
+                        )
+                        result_path[0] = GCode3mfPacker.pack(original, slots=pack_slots)
+
+            except Exception as exc:
+                error_msg[0] = str(exc)
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+        from PyQt6.QtWidgets import QApplication
+        while t.is_alive():
+            QApplication.processEvents()
+            t.join(timeout=0.05)
+
+        prog.close()
+
+        if error_msg[0]:
+            QMessageBox.critical(self, "Erro ao gerar arquivo", error_msg[0])
+            return
+
+        generated = result_path[0]
+        if not generated or not os.path.isfile(generated):
+            QMessageBox.critical(self, "Erro", "Arquivo não foi gerado.")
+            return
+
+        # Nome sugerido — usa campo FILE NAME digitado pelo usuário
+        user_custom = self._inp_filename.text().strip()
+        base_name = user_custom if user_custom else os.path.splitext(os.path.basename(filepath))[0]
+        for suf in (".gcode", "_se3d"):
+            if base_name.endswith(suf):
+                base_name = base_name[:-len(suf)]
+
+        if upload_mode == "gcode_only":
+            suggested    = base_name + "_se3d.gcode"
+            file_filter  = "GCode Files (*.gcode);;Todos os arquivos (*)"
+            dialog_title = "Salvar .gcode"
+        else:
+            suggested    = base_name + ".gcode.3mf"
+            file_filter  = "3MF GCode (*.gcode.3mf);;Todos os arquivos (*)"
+            dialog_title = "Salvar .gcode.3mf"
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            dialog_title,
+            os.path.join(os.path.expanduser("~"), "Desktop", suggested),
+            file_filter
+        )
+        if not save_path:
+            return
+
+        import shutil
+        try:
+            shutil.copy2(generated, save_path)
+            extra = "" if upload_mode == "gcode_only" else (
+                "\n\nVocê pode inspecionar o conteúdo\n"
+                "(renomeie para .zip e abra com qualquer descompactador)."
+            )
+            QMessageBox.information(
+                self, "Arquivo salvo",
+                f"Arquivo salvo em:\n{save_path}{extra}"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Erro ao salvar", str(exc))
 
 
 # ─────────────────────────────────────────────
@@ -1209,7 +1541,7 @@ class PrinterStatusPanel(QWidget):
             return
         project = data.get("project", {})
         if project:
-            state  = project.get("state", "")
+            state  = project.get("state") or ""
             pct    = project.get("progress", 0)
             layer  = project.get("curr_layer",    "--")
             layers = project.get("total_layers",  "--")
@@ -1222,7 +1554,7 @@ class PrinterStatusPanel(QWidget):
                 "failed":       "#FF4444",
                 "stoped":       "#607080",
             }
-            self._sv(self._v_state,    state.upper() or "--", colors.get(state, "#607080"))
+            self._sv(self._v_state,    state.upper() if state else "--", colors.get(state, "#607080"))
             self._sv(self._v_progress, f"{pct}%", "#00E5FF" if pct else "#607080")
             self._sv(self._v_layer,    f"{layer}/{layers}", "#8090A0")
             if eta:
@@ -1441,6 +1773,7 @@ class PrintSetupScreen(QWidget):
     def update_connection(self, connected: bool, ip: str = ""):
         if hasattr(self, "_status_panel"):
             self._status_panel.set_connected(connected, ip)
+            
 
     def set_mqtt(self, mqtt_client):
         if hasattr(self, "_status_panel"):
@@ -1448,12 +1781,12 @@ class PrintSetupScreen(QWidget):
 
     def update_printer_state(self, state: str):
         self._last_printer_state = state
-        busy = state not in ("IDLE", "OFFLINE", "")
-        # Mostra o botão sempre que estiver imprimindo, com ou sem ACE Pro
+        is_idle    = state in ("IDLE", "")
+        is_offline = state in ("OFFLINE",)
+        is_busy    = not is_idle and not is_offline
+
         if hasattr(self, "_btn_status"):
-            self._btn_status.setVisible(busy)
-        #if hasattr(self, "_btn_watch"):
-        #    self._btn_watch.setVisible(busy)
+            self._btn_status.setVisible(is_busy)
 
     def set_ace_ready(self):
         """Dados do ACE chegaram — apenas reavalia o estado atual."""
@@ -1510,8 +1843,10 @@ class _UploadProgressScreen(QWidget):
         self._lbl_err = QLabel("")
         self._lbl_err.setFont(QFont("Courier New", 9))
         self._lbl_err.setStyleSheet("color:#FF4444;")
-        self._lbl_err.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_err.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self._lbl_err.setWordWrap(True)
+        self._lbl_err.setMinimumHeight(200)
+        self._lbl_err.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._lbl_err.setVisible(False)
 
         btn = QPushButton("CANCELAR")
@@ -1521,7 +1856,7 @@ class _UploadProgressScreen(QWidget):
 
         root.addStretch()
         root.addWidget(lbl)
-        root.addSpacing(8)
+        root.addSpacing(10)
         root.addWidget(self._lbl_step, alignment=Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self._bar,      alignment=Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self._lbl_err,  alignment=Qt.AlignmentFlag.AlignCenter)
@@ -1852,37 +2187,17 @@ class PrintWidget(QWidget):
     def load_file_from_arg(self, path: str):
         self._on_file_loaded(path)
 
+    # print_widget.py - substitua o método _on_confirmed inteiro
+
     def _on_confirmed(self, job: dict):
-        import copy, threading
+        import threading
 
-        filepath         = job["filepath"]
-        # .gcode.3mf do slicer deve ser reprocessado para garantir paint_info correto
-        # Só pula o pack para .3mf puro (projeto BambuStudio/OrcaSlicer)
-        fname_lower = filepath.lower()
-        is_3mf = fname_lower.endswith(".3mf") and not fname_lower.endswith(".gcode.3mf")
-        configured_slots = self._settings.get("slots", [])
-
-        # Monta lista de slots para o pack:
-        # paint_index = índice do slicer (T0, T1...) — deve bater com os Tx do gcode
-        # paint_color/material_type = do slot ACE mapeado pelo usuário
-        pack_slots_map = []
-        for m in job.get("color_mapping", []):
-            slicer_idx = m["slicer"]   # Tx do gcode
-            ace_idx    = m["ace"]      # slot físico no ACE Pro
-            if ace_idx < len(configured_slots):
-                s = configured_slots[ace_idx]
-                pack_slots_map.append({
-                    "paint_index":   slicer_idx,
-                    "paint_color":   s.get("paint_color",   [200, 200, 200]),
-                    "material_type": s.get("material_type", "PLA"),
-                    # índice ACE físico — usado pelo ams_box_mapping no MQTT
-                    "ace_index":     ace_idx,
-                })
+        filepath = job["filepath"]
 
         self._settings["last_options"] = {
             "auto_leveling":    job.get("auto_leveling",    True),
             "resonance":        job.get("resonance",        False),
-            "timelapse":        job.get("timelapse",        False),
+            "timelapse":        job.get("timelapse",        True),
             "flow_calibration": job.get("flow_calibration", False),
             "ai_detection":     job.get("ai_detection",     False),
             "dry_mode":         job.get("dry_mode",         0),
@@ -1895,74 +2210,115 @@ class PrintWidget(QWidget):
 
         def _worker():
             try:
-                if not is_3mf:
-                    self._upload_screen.set_step("Lendo arquivo gcode...", 15)
-                    from main import GCode3mfPacker
-                    original = filepath
-                    # Se é .gcode.3mf do slicer, extrair o gcode interno primeiro
-                    if filepath.lower().endswith(".gcode.3mf"):
-                        original = GCode3mfPacker.extract_gcode(filepath)
+                from main import GCode3mfPacker
+
+                upload_mode = self._settings.get("upload_mode", "full")
+
+                if upload_mode == "gcode_only":
+                    self._upload_screen.set_step("Preparando arquivo...", 30)
+                    # Lê o gcode e injeta topdown thumb
+                    src = filepath
+                    fname_lower = filepath.lower()
+                    if fname_lower.endswith(".gcode.3mf") or fname_lower.endswith(".3mf"):
+                        src = GCode3mfPacker.extract_gcode(filepath)
+                    for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+                        try:
+                            with open(src, "r", encoding=enc) as _f:
+                                gcode_raw = _f.read()
+                            break
+                        except UnicodeDecodeError:
+                            continue
                     else:
-                        for suf in ("_se3d.gcode", "_se3d"):
-                            if os.path.basename(original).endswith(suf):
-                                candidate = original[:-len(suf)] + (".gcode" if suf == "_se3d" else "")
-                                if os.path.exists(candidate):
-                                    original = candidate
-                                break
+                        with open(src, "rb") as _f:
+                            gcode_raw = _f.read().decode("utf-8", errors="replace")
+                    if "M486 S" in gcode_raw and 'A"' in gcode_raw:
+                        gcode_raw = GCode3mfPacker._convert_orca_to_klipper_objects(gcode_raw)
+                    # paint_info com índices físicos do ACE Pro — necessário para
+                    # reimpressão pelo display (a impressora verifica compatibilidade
+                    # comparando paint_index com os slots físicos carregados)
+                    configured_slots_go = self._settings.get("slots", [])
+                    pack_slots_map_go = []
+                    for m in job.get("color_mapping", []):
+                        slicer_idx = m["slicer"]
+                        ace_idx    = m["ace"]
+                        if ace_idx < len(configured_slots_go):
+                            s = configured_slots_go[ace_idx]
+                            phys_idx = s.get("index", s.get("paint_index", ace_idx))
+                            pack_slots_map_go.append({
+                                "paint_index":   int(phys_idx),
+                                "paint_color":   s.get("paint_color",   [200, 200, 200]),
+                                "material_type": s.get("material_type", "PLA"),
+                            })
+                    if pack_slots_map_go:
+                        gcode_raw = GCode3mfPacker._inject_paint_info(gcode_raw, pack_slots_map_go)
+                    self._upload_screen.set_step("Gerando thumbnail...", 55)
+                    topdown = GCode3mfPacker._generate_topdown_thumb(gcode_raw)
+                    if topdown:
+                        gcode_raw = GCode3mfPacker._replace_topdown_in_gcode(gcode_raw, topdown)
+                    # Salva em temp com nome do usuário
+                    user_name_go = job.get("task_name", "").strip() or "print"
+                    import tempfile as _tmp2
+                    out_dir_go = os.path.join(
+                        os.environ.get("LOCALAPPDATA", _tmp2.gettempdir()),
+                        "AnyConnect", "SE3D_Hub", "Anycubic"
+                    )
+                    os.makedirs(out_dir_go, exist_ok=True)
+                    import datetime as _dt2
+                    ts_go = _dt2.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    final_filepath = os.path.join(out_dir_go, f"{user_name_go}_{ts_go}.gcode")
+                    with open(final_filepath, "w", encoding="utf-8") as _f:
+                        _f.write(gcode_raw)
+                    job["filepath"]    = final_filepath
+                    job["upload_mode"] = "gcode_only"
+                    # NÃO sobrescreve task_name — usa o do usuário
+
+                else:
+                    # Modo full — inclui mapeamento de slots do ACE Pro
                     self._upload_screen.set_step("Empacotando em .gcode.3mf...", 40)
+                    configured_slots = self._settings.get("slots", [])
+
+                    pack_slots_map = []
+                    for m in job.get("color_mapping", []):
+                        slicer_idx = m["slicer"]
+                        ace_idx    = m["ace"]
+                        if ace_idx < len(configured_slots):
+                            s = configured_slots[ace_idx]
+                            pack_slots_map.append({
+                                "paint_index":   slicer_idx,
+                                "paint_color":   s.get("paint_color",   [200, 200, 200]),
+                                "material_type": s.get("material_type", "PLA"),
+                                "ace_index":     ace_idx,
+                            })
+
                     ace_connected = self._settings.get("ace_connected", False)
-                    # Use user color mapping when available — fixes code 10133 on reprint.
                     if pack_slots_map:
                         pack_slots = pack_slots_map
                     elif ace_connected:
                         pack_slots = configured_slots
                     else:
                         pack_slots = None
-                    gcode_3mf_path = GCode3mfPacker.pack(original, slots=pack_slots)
-                    self._upload_screen.set_step("Arquivo empacotado ✓", 60)
-                    job["filepath"]  = gcode_3mf_path
-                    job["task_name"] = os.path.basename(gcode_3mf_path)
-                else:
-                    self._upload_screen.set_step("Arquivo .3mf pronto ✓", 45)
-                    job["task_name"] = os.path.basename(filepath)
 
+                    gcode_3mf_path = GCode3mfPacker.pack(filepath, slots=pack_slots)
+                    final_filepath = gcode_3mf_path
+
+                # Usa o nome digitado pelo usuário; se vazio, usa basename do arquivo gerado
+                user_task_name = job.get("task_name", "").strip()
+                if not user_task_name:
+                    user_task_name = os.path.splitext(os.path.basename(final_filepath))[0]
+
+                job["filepath"]              = final_filepath
+                job["task_name"]             = user_task_name
                 job["file_id"]               = ""
-                job["slots_config"]          = configured_slots
+                job["slots_config"]          = self._settings.get("slots", [])
                 job["printer_ip"]            = self._settings.get("printer_ip", "")
                 job["color_mapping_for_acm"] = job.get("color_mapping", [])
                 job["ace_connected"]         = self._settings.get("ace_connected", False)
-                
+
                 self._current_job   = job
                 self._current_thumb = job.get("thumbnail")
 
-                # Persiste filepath e task_name para restaurar thumb após reinício
-                self._settings["last_job_filepath"] = job.get("filepath", "")
-                self._settings["last_job_name"]     = job.get("task_name", "")
-                try:
-                    from core import settings as _sm
-                    _sm.save(self._settings)
-                except Exception:
-                    pass
-
-                # Atualiza job_state com o path final do .gcode.3mf
-                final_path = job.get("filepath", filepath)
-                try:
-                    from core import job_state
-                    state = job_state.load()
-                    job_state.save(
-                        filepath=final_path,
-                        task_name=os.path.basename(final_path),
-                        preview_png=state.get("preview_png", ""),
-                    )
-                except Exception:
-                    pass
-
                 self._upload_screen.set_step("Enviando para a impressora...", 75)
                 self.command_ready.emit("print_start", job)
-
-                # Switch to workbench after 2s — faster feedback, MQTT may also trigger it
-                import time as _time
-                _time.sleep(2)
                 self._go_workbench_sig.emit()
 
             except Exception as exc:
@@ -1997,6 +2353,16 @@ class PrintWidget(QWidget):
         self._upload_screen.reset()
 
         def _worker():
+            import datetime as _dt_log
+            import os,sys
+            #_log_path = os.path.join(os.path.expanduser("~"), "C:\\Users\\Roberto\\Desktop\\se3d_debug.log")
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            _log_path = os.path.join(desktop, "se3d_debug.log")
+            with open(_log_path, "w", encoding="utf-8") as _lf:
+                _lf.write(f"[{_dt_log.datetime.now()}] worker iniciado\n")
+                _lf.write(f"upload_mode: {self._settings.get('upload_mode')}\n")
+                _lf.write(f"color_mapping: {job.get('color_mapping')}\n")
+                _lf.write(f"slots: {self._settings.get('slots')}\n")
             try:
                 if not is_3mf:
                     self._upload_screen.set_step("Lendo arquivo gcode...", 15)
@@ -2041,6 +2407,7 @@ class PrintWidget(QWidget):
 
             except Exception as exc:
                 self._upload_screen.set_error(f"{exc}")
+            
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -2195,8 +2562,15 @@ class PrintWidget(QWidget):
             self._workbench.set_mqtt(mqtt_client)
 
     def update_printer_state(self, state: str):
-        self._colormap.update_printer_state(state)
-        self._setup.update_printer_state(state)
+        is_idle    = state in ("IDLE", "")
+        is_offline = state in ("OFFLINE",)
+        is_busy    = not is_idle and not is_offline
+
+        file_loaded = bool(getattr(self, "_filepath", None))
+        can_print   = is_idle and file_loaded
+
+        if hasattr(self, "_split_container"):
+            self._split_container.setEnabled(can_print)
 
     def show_workbench(self):
         self._stack.setCurrentIndex(2)
