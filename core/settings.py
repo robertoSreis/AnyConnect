@@ -38,7 +38,8 @@ DEFAULT_SETTINGS = {
         "ai_detection":       False,
         "timelapse":          False,
         "flow_calibration":   False,
-    }
+    },
+    "upload_mode": "gcode_only"
 }
 
 

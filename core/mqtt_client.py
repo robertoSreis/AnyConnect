@@ -59,6 +59,7 @@ class MqttClient(PrinterClientBase):
         self._stopping       = False
         self._current_taskid = "-1"   # atualizado pelo print/report
         self._upload_url     = ""     # fileUploadurl do info/report
+        self._lan_fail_count = 0
 
         self._poll = QTimer(self)
         self._poll.timeout.connect(self._request_info)
@@ -132,7 +133,7 @@ class MqttClient(PrinterClientBase):
             data = {"type": 0, "target_hotbed_temp": 0, "target_nozzle_temp": int(value)}
 
         if not self._check_ready("tempature/set"): return
-        topic = f"anycubic/anycubicCloud/v1/web/printer/{MODEL_ID}/{self._device_id}/tempature"
+        topic = f"anycubic/anycubicCloud/v1/web/printer/{self._model_id}/{self._device_id}/tempature"
         self._publish(topic, "tempature", "set", data)
 
     def set_fan(self, fan, value):
@@ -153,7 +154,7 @@ class MqttClient(PrinterClientBase):
             return
 
         if not self._check_ready("fan/setSpeed"): return
-        topic = f"anycubic/anycubicCloud/v1/web/printer/{MODEL_ID}/{self._device_id}/fan"
+        topic = f"anycubic/anycubicCloud/v1/web/printer/{self._model_id}/{self._device_id}/fan"
         self._publish(topic, "fan", "setSpeed", data)
 
     def set_speed(self, mode):
@@ -200,17 +201,46 @@ class MqttClient(PrinterClientBase):
     def stop_print(self):
         self._pub_slicer_print("stop", {"taskid": self._current_taskid})
 
+    # mqtt_client.py - dentro de start_print(), substitua a chamada _do_upload_and_start
+    def _upload_gcode_via_mqtt(self, filepath: str, filename: str, job: dict | None):
+        """Envia arquivo GCode diretamente via MQTT (sem HTTP)."""
+        import os, base64, hashlib, json as _json, uuid, time
+        
+        if not self._check_ready("file/upload"):
+            return
+        
+        with open(filepath, "rb") as f:
+            data = f.read()
+        
+        filesize = len(data)
+        file_b64 = base64.b64encode(data).decode('ascii')
+        file_md5 = hashlib.md5(data).hexdigest()
+        
+        payload = {
+            "type": "file",
+            "action": "upload",
+            "msgid": str(uuid.uuid4()),
+            "timestamp": int(time.time() * 1000),
+            "data": {
+                "filename": filename,
+                "filesize": filesize,
+                "filedata": file_b64,
+                "md5": file_md5
+            }
+        }
+        
+        topic = f"anycubic/anycubicCloud/v1/slicer/printer/{self._model_id}/{self._device_id}/file"
+        self._client.publish(topic, json.dumps(payload), qos=0)
+        self._emit_log(f"[MQTT] Upload via MQTT: {filename} ({filesize} bytes)")
+        
+        # Após o upload, envia o comando print/start
+        self._mqtt_start_print(filename, filesize, file_md5, job)
+
+
     def start_print(self, filename, file_id="", filepath="", job=None, **kw):
-        """
-        Fluxo completo conforme Rinkhals docs:
-          1. Upload HTTP multipart para fileUploadurl (do info/report)
-          2. MQTT print/start com filename, filesize, md5, task_settings, ams_settings
-        Se não tiver upload_url ainda, pede info/report e tenta novamente em 3s.
-        """
         if not self._check_ready("print/start"):
             return
 
-        # Resolver filepath: pode vir direto ou via job dict
         if not filepath and job:
             filepath = job.get("filepath", "")
 
@@ -219,23 +249,20 @@ class MqttClient(PrinterClientBase):
             self._mqtt_start_print(filename, 0, "", job)
             return
 
-        # Se não temos upload_url ainda, aguarda info/report chegar e retenta
         if not self._upload_url:
             self._emit_log("  start_print: aguardando fileUploadurl (pedindo info)...")
             self._request_info()
-            # Reagendar em 3s com os mesmos parâmetros
-            QTimer.singleShot(3000, lambda: self.start_print(
-                filename, file_id=file_id, filepath=filepath, job=job))
+            QMetaObject.invokeMethod(self, "_retry_start_print", Qt.ConnectionType.QueuedConnection)
+            self._pending_start = (filename, file_id, filepath, job)
             return
 
-        # Fazer upload em thread para não bloquear a UI
         upload_url = self._upload_url
         threading.Thread(
             target=self._do_upload_and_start,
             args=(filepath, filename, upload_url, job),
             daemon=True
         ).start()
-
+    
     def _do_upload_and_start(self, filepath: str, filename: str,
                               upload_url: str, job: dict | None):
         """Thread: faz HTTP upload e depois dispara MQTT print/start."""
@@ -246,19 +273,32 @@ class MqttClient(PrinterClientBase):
             filesize = len(data)
 
             raw_name = os.path.basename(filepath)
+            upload_mode = (job or {}).get("upload_mode", "full")
+            task_name   = (job or {}).get("task_name", "").strip()
 
-            # Nome do arquivo para HTTP e MQTT — usa o nome original sem sanitizar
-            # O sniffer confirma que o AnycubicSlicerNext envia o nome original
-            # (com espaços e parênteses) em ambos HTTP e MQTT, e o servidor aceita
-            if raw_name.lower().endswith(".gcode.3mf"):
-                fname = raw_name.replace("_se3d.gcode.3mf", ".gcode.3mf")
+            if upload_mode == "gcode_only":
+                # Usa o nome escolhido pelo usuário + .gcode
+                if task_name:
+                    fname = task_name + ".gcode"
+                else:
+                    fname = raw_name
+            elif raw_name.lower().endswith(".gcode.3mf"):
+                if task_name:
+                    fname = task_name + ".gcode.3mf"
+                else:
+                    fname = raw_name.replace("_se3d.gcode.3mf", ".gcode.3mf")
             else:
-                base = raw_name
-                for suf in ("_se3d.gcode", ".gcode", ".gc"):
-                    if base.lower().endswith(suf):
-                        base = base[:-len(suf)]
-                        break
-                fname = base + ".gcode.3mf"
+                if task_name:
+                    fname = task_name + ".gcode.3mf"
+                else:
+                    base = raw_name
+                    for suf in ("_se3d.gcode", ".gcode", ".gc"):
+                        if base.lower().endswith(suf):
+                            base = base[:-len(suf)]
+                            break
+                    fname = base + ".gcode.3mf"
+
+            
 
             self._emit_log(f"  upload → {upload_url}")
             self._emit_log(f"  arquivo local : {raw_name}  ({filesize:,} bytes)")
@@ -362,11 +402,14 @@ class MqttClient(PrinterClientBase):
                 rgb      = ace_slot.get("paint_color", [255, 255, 255])[:3]
                 mat      = ace_slot.get("material_type", "PLA")
 
-                # paint_color = cor do filamento do slicer (sem alpha)
-                # ams_color   = cor real do slot ACE (sem alpha)
+                # ams_index deve ser o índice FÍSICO do slot no ACE Pro
+                # O campo "index" do slot contém o índice real (0-3)
+                # Se não existir, usa ace_idx como fallback
+                physical_index = ace_slot.get("index", ace_slot.get("paint_index", ace_idx))
+
                 ace_slots.append({
                     "paint_index":   slicer_idx,
-                    "ams_index":     ace_idx,
+                    "ams_index":     int(physical_index),
                     "paint_color":   [int(rgb[0]), int(rgb[1]), int(rgb[2])],
                     "ams_color":     [int(rgb[0]), int(rgb[1]), int(rgb[2])],
                     "material_type": mat,
@@ -392,6 +435,36 @@ class MqttClient(PrinterClientBase):
         dry_temp          = int(job.get("dry_temp",  35))
         dry_hours         = int(job.get("dry_hours", 12))
         dry_duration_min  = dry_hours * 60             # impressora usa minutos
+
+        # model_objects_skip_parts: lista de nomes de objetos do gcode.
+        # Confirmado pelo sniffer: o AnycubicSlicerNext preenche com os nomes dos
+        # EXCLUDE_OBJECT_DEFINE — isso sinaliza ao firmware que o arquivo suporta
+        # skip de partes e habilita a opção no display durante a impressão.
+        # Lista vazia = firmware não mostra a opção de skip.
+        filepath_for_scan = job.get("filepath", "")
+        skip_parts = []
+        if filepath_for_scan:
+            try:
+                import zipfile as _zf, re as _re
+                _fn_lower = filepath_for_scan.lower()
+                if _fn_lower.endswith(".3mf") or _fn_lower.endswith(".gcode.3mf"):
+                    zf = _zf.ZipFile(filepath_for_scan)
+                    for entry in zf.namelist():
+                        if entry.endswith(".gcode") and "metadata" not in entry:
+                            gcode_bytes = zf.read(entry)
+                            gcode_text  = gcode_bytes[:20000].decode("utf-8", errors="replace")
+                            skip_parts  = _re.findall(r'EXCLUDE_OBJECT_DEFINE NAME=(\S+)', gcode_text)
+                            if skip_parts:
+                                break
+                    zf.close()
+                else:
+                    # .gcode direto — lê primeiras 30k chars
+                    with open(filepath_for_scan, "r", encoding="utf-8", errors="replace") as _fg:
+                        gcode_text = _fg.read(30000)
+                    skip_parts = _re.findall(r'EXCLUDE_OBJECT_DEFINE NAME=(\S+)', gcode_text)
+            except Exception:
+                pass
+
         data["task_settings"] = {
             "auto_leveling":          1 if job.get("auto_leveling",    True)  else 0,
             "vibration_compensation": 1 if job.get("resonance",        False) else 0,
@@ -413,7 +486,7 @@ class MqttClient(PrinterClientBase):
                 "duration":    dry_duration_min if dry_mode > 0 else 0,
                 "remain_time": 0,
             },
-            "model_objects_skip_parts": [],
+            "model_objects_skip_parts": skip_parts,
         }
 
         # ams_settings — só ativa ACE se tiver mapeamento configurado
@@ -427,6 +500,17 @@ class MqttClient(PrinterClientBase):
 
         self._emit_log(f"  MQTT print/start: {json.dumps(data)[:500]}")
         self._pub_slicer_print("start", data)
+
+    @pyqtSlot()
+    def _retry_start_print(self):
+        """Chamado na thread Qt após aguardar upload_url — retenta start_print em 3s."""
+        pending = getattr(self, "_pending_start", None)
+        if pending is None:
+            return
+        self._pending_start = None
+        filename, file_id, filepath, job = pending
+        QTimer.singleShot(3000, lambda: self.start_print(
+            filename, file_id=file_id, filepath=filepath, job=job))
 
     def set_filament_slot(self, slot):
         self._pub_slicer("multiColor", "set", {"index": slot})
@@ -456,14 +540,14 @@ class MqttClient(PrinterClientBase):
         """Tópico axis — confirmado pelo sniffer do Slicer Next."""
         if not self._check_ready(f"axis/{action}"): return
         topic = (f"anycubic/anycubicCloud/v1/web/printer/"
-                 f"{MODEL_ID}/{self._device_id}/axis")
+                 f"{self._model_id}/{self._device_id}/axis")
         self._publish(topic, "axis", action, data or {})
 
     def _pub_web_file(self, action, data=None):
         """Tópico file — listagem e gerenciamento de arquivos."""
         if not self._check_ready(f"file/{action}"): return
         topic = (f"anycubic/anycubicCloud/v1/web/printer/"
-                 f"{MODEL_ID}/{self._device_id}/file")
+                 f"{self._model_id}/{self._device_id}/file")
         self._publish(topic, "file", action, data or {})
 
     def motors_off(self):
@@ -509,7 +593,7 @@ class MqttClient(PrinterClientBase):
         """
         if not self._check_ready("video/startCapture"): return
         topic = (f"anycubic/anycubicCloud/v1/web/printer/"
-                 f"{MODEL_ID}/{self._device_id}/video")
+                 f"{self._model_id}/{self._device_id}/video")
         self._publish(topic, "video", "startCapture", {})
 
     def camera_stop(self):
@@ -518,17 +602,17 @@ class MqttClient(PrinterClientBase):
         """
         if not self._check_ready("video/stopCapture"): return
         topic = (f"anycubic/anycubicCloud/v1/web/printer/"
-                 f"{MODEL_ID}/{self._device_id}/video")
+                 f"{self._model_id}/{self._device_id}/video")
         self._publish(topic, "video", "stopCapture", {})
 
     def _pub_web_ace(self, action, data):
         """Tópico correto para ACE Pro — confirmado pelo sniffer do Slicer Next.
-        Usa: .../web/printer/{MODEL_ID}/{device_id}/multiColorBox
+        Usa: .../web/printer/{self._model_id}/{device_id}/multiColorBox
         Action names corretos: getInfo, setDry, setAutoFeed, feedFilament
         """
         if not self._check_ready(f"multiColorBox/{action}"): return
         topic = (f"anycubic/anycubicCloud/v1/web/printer/"
-                 f"{MODEL_ID}/{self._device_id}/multiColorBox")
+                 f"{self._model_id}/{self._device_id}/multiColorBox")
         self._publish(topic, "multiColorBox", action, data)
 
     def ace_auto_refill(self, enabled):
@@ -622,6 +706,78 @@ class MqttClient(PrinterClientBase):
 
     # ── Conexão LAN ───────────────────────────────────────────────────────
     def _do_connect_lan(self):
+        # Incrementa contador a cada tentativa
+        
+
+        # Só mostra o log inicial na 1ª tentativa e a cada 20
+        if self._lan_fail_count == 1 or self._lan_fail_count % 20 == 0:
+            self._emit_log(f"→ TLS {self._host}:{LAN_PORT}  user={self._mqtt_user}")
+
+        try:
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ssl_ctx.set_ciphers('ALL:@SECLEVEL=0')
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+
+            try:
+                client = mqtt.Client(
+                    mqtt.CallbackAPIVersion.VERSION1,
+                    client_id=self._mqtt_cid,
+                    clean_session=True,
+                    protocol=mqtt.MQTTv311
+                )
+            except AttributeError:
+                client = mqtt.Client(
+                    client_id=self._mqtt_cid,
+                    clean_session=True,
+                    protocol=mqtt.MQTTv311
+                )
+
+            client.reconnect_delay_set(min_delay=0, max_delay=0)
+
+            client.username_pw_set(self._mqtt_user, self._mqtt_pass)
+            client.tls_set_context(ssl_ctx)
+            client.tls_insecure_set(True)
+            client.on_connect = self._on_connect
+            client.on_disconnect = self._on_disconnect
+            client.on_message = self._on_message
+
+            def on_log(c, ud, level, buf):
+                if level <= 8:
+                    self._emit_log(f"  paho: {buf}")
+            client.on_log = on_log
+
+            self._client = client
+            client.connect(self._host, LAN_PORT, keepalive=60)
+            client.loop_start()
+
+            # Conectou com sucesso: reseta contador
+            self._lan_fail_count = 0
+
+        except OSError as e:
+            
+            # Só mostra erro na 1ª tentativa e a cada 20
+            if self._lan_fail_count == 1 or self._lan_fail_count % 6 == 0:
+                self.connection_error.emit(
+                    f"Não foi possível conectar a {self._host}:{LAN_PORT}\n\n"
+                    f"IP correto? ({self._host})\nImpressora ligada e na rede?\n\nErro: {e}"
+                )
+            # Reseta contador ao atingir 20
+            self._lan_fail_count += 1
+            if self._lan_fail_count >= 6:
+                self._lan_fail_count = 0
+            
+        except Exception as e:
+            import traceback
+            if self._lan_fail_count == 9 or self._lan_fail_count % 15 == 0:
+                self.connection_error.emit(f"MQTT erro:\n{type(e).__name__}: {e}\n\n{traceback.format_exc()[-600:]}")
+            self._lan_fail_count += 1
+            if self._lan_fail_count >= 15:
+                self._lan_fail_count = 0
+
+
+
+    def _do_connect_lan_OLD(self):
         self._emit_log(f"→ TLS {self._host}:{LAN_PORT}  user={self._mqtt_user}")
         try:
             ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -674,11 +830,14 @@ class MqttClient(PrinterClientBase):
     def _destroy_client(self):
         c = self._client
         self._client = None
+        self._connected_flag = False
         if c:
+            self._stopping = True   # evita que on_disconnect dispare o signal
             try: c.loop_stop()
             except: pass
             try: c.disconnect()
             except: pass
+            self._stopping = False
 
     # ── Callbacks ─────────────────────────────────────────────────────────
     def _on_connect(self, client, ud, flags, rc, *args):
@@ -698,8 +857,8 @@ class MqttClient(PrinterClientBase):
 
         did = self._device_id
         subs = [
-            f"anycubic/anycubicCloud/v1/printer/public/{MODEL_ID}/{did or '+'}/#",
-            f"anycubic/anycubicCloud/v1/printer/app/{MODEL_ID}/{did or '+'}/#",
+            f"anycubic/anycubicCloud/v1/printer/public/{self._model_id}/{did or '+'}/#",
+            f"anycubic/anycubicCloud/v1/printer/app/{self._model_id}/{did or '+'}/#",
         ]
         for t in subs:
             self._emit_log(f"  subscribe: {t}")
@@ -720,6 +879,9 @@ class MqttClient(PrinterClientBase):
             self.disconnected.emit(
                 "Conexão perdida — clique Reconectar" if rc_int != 0 else "Desconectado"
             )
+    @property
+    def _model_id(self) -> str:
+        return getattr(self, "_detected_model_id", MODEL_ID)
 
     def _on_message(self, client, ud, msg):
         # Atualiza timestamp de resposta — evita wake() falso
@@ -742,14 +904,15 @@ class MqttClient(PrinterClientBase):
         if not self._device_id:
             parts = topic.split("/")
             if len(parts) >= 7 and parts[4] in ("public", "app"):
+                detected_model = parts[5]   # ← model_id está aqui
                 did = parts[6]
                 if did and did != "+":
                     self._device_id = did
                     self._emit_log(f"  device_id detectado: {did}")
                     self.device_id_found.emit(did)
                     for t in [
-                        f"anycubic/anycubicCloud/v1/printer/public/{MODEL_ID}/{did}/#",
-                        f"anycubic/anycubicCloud/v1/printer/app/{MODEL_ID}/{did}/#",
+                        f"anycubic/anycubicCloud/v1/printer/public/{self._model_id}/{did}/#",
+                        f"anycubic/anycubicCloud/v1/printer/app/{self._model_id}/{did}/#",
                     ]:
                         client.subscribe(t)
 
@@ -953,13 +1116,13 @@ class MqttClient(PrinterClientBase):
     def _pub_slicer(self, type_, action, data):
         """Tópico slicer — comandos gerais"""
         if not self._check_ready(f"{type_}/{action}"): return
-        topic = f"anycubic/anycubicCloud/v1/slicer/printer/{MODEL_ID}/{self._device_id}"
+        topic = f"anycubic/anycubicCloud/v1/slicer/printer/{self._model_id}/{self._device_id}"
         self._publish(topic, type_, action, data)
 
     def _pub_slicer_info(self):
         """Info query — tópico especial .../info"""
         if not self._check_ready("info/query"): return
-        topic = f"anycubic/anycubicCloud/v1/slicer/printer/{MODEL_ID}/{self._device_id}/info"
+        topic = f"anycubic/anycubicCloud/v1/slicer/printer/{self._model_id}/{self._device_id}/info"
         payload = {"type": "info", "action": "query", "msgid": _mid(), "timestamp": _ts()}
         self._emit_log(f"  PUB info/query → {self._device_id[:8]}")
         try:
@@ -970,19 +1133,19 @@ class MqttClient(PrinterClientBase):
     def _pub_slicer_print(self, action, data):
         """Print control — tópico .../slicer/.../print"""
         if not self._check_ready(f"print/{action}"): return
-        topic = f"anycubic/anycubicCloud/v1/slicer/printer/{MODEL_ID}/{self._device_id}/print"
+        topic = f"anycubic/anycubicCloud/v1/slicer/printer/{self._model_id}/{self._device_id}/print"
         self._publish(topic, "print", action, data)
 
     def _pub_web(self, type_, action, data, path="print"):
         """Temperatura, velocidade, fans, flow — tópico .../web/.../{path}"""
         if not self._check_ready(f"{type_}/{action}"): return
-        topic = f"anycubic/anycubicCloud/v1/web/printer/{MODEL_ID}/{self._device_id}/{path}"
+        topic = f"anycubic/anycubicCloud/v1/web/printer/{self._model_id}/{self._device_id}/{path}"
         self._publish(topic, type_, action, data)
 
     def _pub_web_light(self, data):
         """Luz — tópico .../web/.../light"""
         if not self._check_ready("light/control"): return
-        topic = f"anycubic/anycubicCloud/v1/web/printer/{MODEL_ID}/{self._device_id}/light"
+        topic = f"anycubic/anycubicCloud/v1/web/printer/{self._model_id}/{self._device_id}/light"
         self._publish(topic, "light", "control", data)
 
     def _publish(self, topic, type_, action, data):
@@ -1036,7 +1199,7 @@ class MqttClient(PrinterClientBase):
     def _pub_last_will(self):
         """lastWill query — confirmado pelo sniffer como parte do ciclo de wake do slicer."""
         if not self._check_ready("lastWill/query"): return
-        topic = f"anycubic/anycubicCloud/v1/web/printer/{MODEL_ID}/{self._device_id}/lastWill"
+        topic = f"anycubic/anycubicCloud/v1/web/printer/{self._model_id}/{self._device_id}/lastWill"
         payload = {"type": "lastWill", "action": "query",
                    "msgid": _mid(), "timestamp": _ts(), "data": None}
         try:
@@ -1055,7 +1218,7 @@ class MqttClient(PrinterClientBase):
         """
         # lastWill primeiro — exatamente como o AnycubicSlicer faz
         self._pub_last_will()
-        base_w = f"anycubic/anycubicCloud/v1/web/printer/{MODEL_ID}/{self._device_id}"
+        base_w = f"anycubic/anycubicCloud/v1/web/printer/{self._model_id}/{self._device_id}"
         for path in ("status", "info", "tempature", "fan", "peripherie", "light"):
             if not self._connected_flag:
                 return
