@@ -1,0 +1,6 @@
+opencv_python==4.12.0.88
+paho_mqtt==2.1.0
+paramiko==4.0.0
+PyQt6==6.10.2
+pyqt6_sip==13.11.1
+websocket_client==1.8.0
